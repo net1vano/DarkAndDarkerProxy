@@ -17,4 +17,4 @@ EXPOSE 8080
 EXPOSE 20000-20250
 
 # Запуск приложения
-CMD ["python", "proxy.py"]
+CMD ["python", "app.py"]
