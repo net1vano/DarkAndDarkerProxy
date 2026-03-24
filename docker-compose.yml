@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  game-proxy:
+    build: .
+    container_name: game-proxy
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # МАППИНГ ПОРТОВ
+      # Слева - порт хоста (VPS), Справа - порт контейнера
+
+      # 1. HTTP Конфиг: Внешний 80 -> Внутренний 8080
+      - "80:8080"
+
+      # 2. Игровые порты: Диапазон 1 к 1
+      - "20000-20250:20000-20250"
+
+    # Увеличиваем лимит файловых дескрипторов для большого кол-ва соединений
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # Логирование
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Сеть
+    network_mode: "bridge"
