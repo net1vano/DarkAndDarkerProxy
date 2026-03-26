@@ -175,6 +175,7 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
                                 return
                             data['ipAddress'] = PROXY_PUBLIC_IP
                             data['port'] = proxy_port
+                            data['remote'] = client_addr[0]
                             response_body = json.dumps(data).encode('utf-8')
                             http_response = (
                                                 b"HTTP/1.1 200 OK\r\n"

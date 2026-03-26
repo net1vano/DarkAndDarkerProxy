@@ -6,7 +6,6 @@
 
 
 <kbd>WIN</kbd> + <kbd>R</kbd>  
-`cmd`  
 `notepad %windir%/system32/drivers/etc/hosts`  
 <kbd>CTRL</kbd>+<kbd>SHIFT</kbd>+<kbd>ENTER</kbd> - чтобы запустить блокнот от имени администратора
 
