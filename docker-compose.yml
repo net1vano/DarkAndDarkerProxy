@@ -5,9 +5,6 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    ports:
-      - "80:8080"
-      - "20000-20500:20000-20500"
     ulimits:
       nofile:
         soft: 65536
@@ -17,4 +14,4 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    network_mode: "bridge"
+    network_mode: "host"
