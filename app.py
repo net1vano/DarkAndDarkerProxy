@@ -11,8 +11,8 @@ PROXY_PUBLIC_IP = os.getenv("PROXY_PUBLIC_IP", "127.0.0.1")
 REAL_API_URL = os.getenv("REAL_API_URL", "http://localhost/config")
 HTTP_PORT = int(os.getenv("INTERNAL_HTTP_PORT", "80"))
 GAME_PORT_START = int(os.getenv("GAME_PORT_START", "20000"))
-GAME_PORT_END = int(os.getenv("GAME_PORT_END", "20500"))
-MAPPING_TTL = int(os.getenv("MAPPING_TTL", "300"))
+GAME_PORT_END = int(os.getenv("GAME_PORT_END", "20250"))
+MAPPING_TTL = int(os.getenv("MAPPING_TTL", "600"))
 CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "120"))
 
 # Настройка логгирования
@@ -95,31 +95,7 @@ class PortMapper:
                     self.stats['active_connections'] = len(self.mapping)
                     logger.info(f"Cleaned up {len(expired)} expired mappings")
 
-    def get_stats(self) -> Dict:
-        uptime = time.time() - self.stats['start_time']
-        return {
-            'status': 'running',
-            'uptime_seconds': round(uptime, 2),
-            'total_connections': self.stats['total_connections'],
-            'active_connections': self.stats['active_connections'],
-            'port_pool_size': GAME_PORT_END - GAME_PORT_START + 1,
-            'ports_available': GAME_PORT_END - GAME_PORT_START + 1 - len(self.mapping)
-        }
-
-
 mapper = PortMapper()
-
-async def handle_health_check(writer: asyncio.StreamWriter):
-    stats = mapper.get_stats()
-    response_body = json.dumps(stats, indent=2).encode('utf-8')
-    http_response = (
-                        b"HTTP/1.1 200 OK\r\n"
-                        b"Content-Type: application/json\r\n"
-                        b"Connection: close\r\n"
-                        b"\r\n"
-                    ) + response_body
-    writer.write(http_response)
-    await writer.drain()
 
 
 async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -153,12 +129,6 @@ async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.Stre
             headers += line
             if line == b"\r\n":
                 break
-        if path == '/health':
-            logger.info(f"Health check from {client_addr}")
-            await handle_health_check(writer)
-            writer.close()
-            await writer.wait_closed()
-            return
         logger.info(f"Config request from {client_addr}")
         async with aiohttp.ClientSession() as session:
             try:
@@ -285,7 +255,6 @@ async def main():
         task = asyncio.create_task(start_game_server(port))
         game_tasks.append(task)
     logger.info(f"Game Proxy started on ports {GAME_PORT_START}-{GAME_PORT_END}")
-    logger.info(f"Health check available at: http://{PROXY_PUBLIC_IP}:{HTTP_PORT}/health")
     async with http_server:
         await http_server.serve_forever()
 
