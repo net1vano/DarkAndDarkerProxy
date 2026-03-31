@@ -1,17 +1,13 @@
 services:
-  game-proxy:
+  http-proxy:
     build: .
-    container_name: game-proxy
+    container_name: http-proxy
     restart: unless-stopped
+    network_mode: "host"
     env_file:
       - .env
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
-        max-size: "10m"
+        max-size: "50m"
         max-file: "3"
-    network_mode: "host"

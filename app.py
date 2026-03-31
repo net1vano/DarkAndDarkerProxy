@@ -1,265 +1,161 @@
+# app.py
 import asyncio
 import aiohttp
 import json
 import logging
-import time
-import os
-from typing import Dict, Tuple, Optional
+import signal
+import sys
 
-# --- КОНФИГУРАЦИЯ ИЗ ENV ---
-PROXY_PUBLIC_IP = os.getenv("PROXY_PUBLIC_IP", "127.0.0.1")
-REAL_API_URL = os.getenv("REAL_API_URL", "http://localhost/config")
-HTTP_PORT = int(os.getenv("INTERNAL_HTTP_PORT", "80"))
-GAME_PORT_START = int(os.getenv("GAME_PORT_START", "20000"))
-GAME_PORT_END = int(os.getenv("GAME_PORT_END", "20250"))
-MAPPING_TTL = int(os.getenv("MAPPING_TTL", "600"))
-CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "120"))
+from config import (
+    PROXY_PUBLIC_IP, PROXY_HTTP_PORT,
+    TARGET_HOST, TARGET_PATH, TARGET_API_URL, LOG_LEVEL
+)
+from mapper import PortMapper
 
-# Настройка логгирования
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Настройка логирования
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-
-class PortMapper:
-    def __init__(self):
-        self.mapping: Dict[int, Dict] = {}
-        self.lock = asyncio.Lock()
-        self.stats = {
-            'total_connections': 0,
-            'active_connections': 0,
-            'start_time': time.time()
-        }
-
-    async def get_free_port(self) -> Optional[int]:
-        async with self.lock:
-            now = time.time()
-            expired = [p for p, m in self.mapping.items() if now - m['created_at'] > MAPPING_TTL]
-            for p in expired:
-                del self.mapping[p]
-            for port in range(GAME_PORT_START, GAME_PORT_END + 1):
-                if port not in self.mapping:
-                    return port
-            return None
-
-    async def set_mapping(self, real_ip: str, real_port: int) -> Optional[int]:
-        proxy_port = await self.get_free_port()
-        if not proxy_port:
-            logger.error("No free proxy ports available in pool!")
-            return None
-
-        async with self.lock:
-            self.mapping[proxy_port] = {
-                'real_ip': real_ip,
-                'real_port': real_port,
-                'created_at': time.time(),
-                'last_activity': time.time()
-            }
-            self.stats['total_connections'] += 1
-            self.stats['active_connections'] = len(self.mapping)
-            logger.info(f"Mapping created: Proxy:{proxy_port} -> Real:{real_ip}:{real_port}")
-            return proxy_port
-
-    async def update_activity(self, proxy_port: int):
-        async with self.lock:
-            if proxy_port in self.mapping:
-                self.mapping[proxy_port]['last_activity'] = time.time()
-
-    async def get_mapping(self, proxy_port: int) -> Optional[Tuple[str, int]]:
-        async with self.lock:
-            if proxy_port in self.mapping:
-                m = self.mapping[proxy_port]
-                now = time.time()
-                if now - m['created_at'] > MAPPING_TTL:
-                    del self.mapping[proxy_port]
-                    self.stats['active_connections'] = len(self.mapping)
-                    return None
-                return m['real_ip'], m['real_port']
-            return None
-
-    async def remove_mapping(self, proxy_port: int):
-        async with self.lock:
-            if proxy_port in self.mapping:
-                del self.mapping[proxy_port]
-                self.stats['active_connections'] = len(self.mapping)
-                logger.info(f"Port {proxy_port} released (connection closed)")
-
-    async def cleanup(self):
-        while True:
-            await asyncio.sleep(CLEANUP_INTERVAL)
-            async with self.lock:
-                now = time.time()
-                expired = [p for p, m in self.mapping.items() if now - m['created_at'] > MAPPING_TTL]
-                for p in expired:
-                    del self.mapping[p]
-                if expired:
-                    self.stats['active_connections'] = len(self.mapping)
-                    logger.info(f"Cleaned up {len(expired)} expired mappings")
-
-mapper = PortMapper()
+# Глобальный маппер
+mapper = PortMapper(PROXY_PUBLIC_IP)
 
 
 async def handle_http_request(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    """
+    HTTP парсер: перехватывает конфиг, сохраняет маппинг, отправляет модифицированный ответ.
+    """
     client_addr = writer.get_extra_info('peername')
+    if not client_addr:
+        writer.close()
+        return
+
+    client_ip, client_port = client_addr
+
     try:
-        request_line = await reader.readline()
+        # Читаем первую строку
+        request_line = await asyncio.wait_for(reader.readline(), timeout=10)
         if not request_line:
             return
-        try:
-            request_text = request_line.decode('utf-8', errors='ignore').strip()
-            parts = request_text.split(' ')
-            if len(parts) != 3 or not parts[0].upper() in ('GET', 'POST', 'HEAD'):
-                logger.warning(f"Invalid HTTP from {client_addr}: {request_text[:50]}")
-                writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                await writer.drain()
-                writer.close()
-                return
-            method, path, version = parts[0], parts[1], parts[2]
-            if not version.startswith('HTTP/'):
-                writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                await writer.drain()
-                writer.close()
-                return
-        except Exception as e:
-            logger.warning(f"HTTP parse error from {client_addr}: {e}")
+
+        # Парсим метод и путь
+        parts = request_line.decode().strip().split()
+        if len(parts) < 3 or parts[0].upper() != 'GET':
             writer.close()
             return
-        headers = b""
+
+        path = parts[1]
+
+        # Читаем заголовки
+        headers = {}
         while True:
-            line = await reader.readline()
-            headers += line
-            if line == b"\r\n":
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+            if line in (b'\r\n', b'\n', b''):
                 break
-        logger.info(f"Config request from {client_addr}")
+            if b':' in line:
+                k, v = line.decode().split(':', 1)
+                headers[k.strip().lower()] = v.strip()
+
+        # 🔐 Фильтр: только целевой домен + путь
+        host = headers.get('host', '').split(':')[0].lower()
+        if host != TARGET_HOST.lower() or path != TARGET_PATH:
+            logger.debug(f"Rejected: {host}{path} from {client_ip}")
+            writer.close()
+            return
+
+        logger.info(f"✓ Intercepted: {host}{path} from {client_ip}:{client_port}")
+
+        # Запрашиваем реальный конфиг
         async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(REAL_API_URL, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if 'ipAddress' in data and 'port' in data:
-                            real_ip = data['ipAddress']
-                            real_port = data['port']
-                            proxy_port = await mapper.set_mapping(real_ip, real_port)
-                            if not proxy_port:
-                                writer.write(b"HTTP/1.1 503 Service Unavailable\r\n\r\nProxy Port Pool Exhausted")
-                                await writer.drain()
-                                return
-                            data['ipAddress'] = PROXY_PUBLIC_IP
-                            data['port'] = proxy_port
-                            data['remote'] = client_addr[0]
-                            response_body = json.dumps(data).encode('utf-8')
-                            http_response = (
-                                                b"HTTP/1.1 200 OK\r\n"
-                                                b"Content-Type: application/json\r\n"
-                                                b"Connection: close\r\n"
-                                                b"\r\n"
-                                            ) + response_body
-                            writer.write(http_response)
-                            await writer.drain()
-                            logger.info(f"Config sent: {real_ip}:{real_port} -> {PROXY_PUBLIC_IP}:{proxy_port}")
-                        else:
-                            logger.error(f"Invalid JSON structure: {data}")
-                            writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\nInvalid Config Format")
-                            await writer.drain()
-                    else:
-                        logger.error(f"API Error: {response.status}")
-                        writer.write(f"HTTP/1.1 {response.status} Error\r\n\r\n".encode())
-                        await writer.drain()
-            except Exception as e:
-                logger.error(f"Failed to fetch config from real API: {e}")
-                writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\nProxy API Error")
+            async with session.get(TARGET_API_URL, timeout=10) as response:
+                if response.status != 200:
+                    writer.write(f"HTTP/1.1 {response.status} Error\r\n\r\n".encode())
+                    await writer.drain()
+                    return
+
+                config = await response.json()
+
+                # Валидация
+                if 'ipAddress' not in config or 'port' not in config:
+                    writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\nInvalid Config")
+                    await writer.drain()
+                    return
+
+                # 🎯 Сохраняем маппинг
+                real_ip = config['ipAddress']
+                real_port = config['port']
+
+                await mapper.create_mapping(client_ip, client_port, real_ip, real_port)
+
+                # 🔑 ПОДМЕНА: реальный IP → прокси IP
+                config['ipAddress'] = PROXY_PUBLIC_IP
+                # Порт оставляем тот же (клиент подключится на proxy_ip:real_port)
+
+                # Отправляем модифицированный JSON
+                body = json.dumps(config).encode()
+                http_response = (
+                                        b"HTTP/1.1 200 OK\r\n"
+                                        b"Content-Type: application/json\r\n"
+                                        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                                                                                        b"Connection: close\r\n"
+                                                                                        b"\r\n"
+                                ) + body
+
+                writer.write(http_response)
                 await writer.drain()
+
+                logger.info(f"✅ Sent to {client_ip}: {PROXY_PUBLIC_IP}:{real_port} (real: {real_ip}:{real_port})")
+
+    except asyncio.TimeoutError:
+        logger.warning(f"HTTP timeout from {client_ip}")
     except Exception as e:
-        logger.error(f"HTTP Handler error: {e}")
+        logger.error(f"Handler error: {e}")
     finally:
+        writer.close()
         try:
-            writer.close()
             await writer.wait_closed()
-        except (ConnectionResetError, BrokenPipeError, RuntimeError):
+        except:
             pass
 
 
-async def forward_data(reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-                       direction: str, proxy_port: int = None):
-    try:
-        while True:
-            data = await reader.read(8192)
-            if not data:
-                break
-            if proxy_port:
-                await mapper.update_activity(proxy_port)
-            writer.write(data)
-            await writer.drain()
-    except asyncio.CancelledError:
-        pass
-    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
-        logger.debug(f"Connection closed naturally ({direction})")
-    except Exception as e:
-        logger.debug(f"Forward error ({direction}): {type(e).__name__}")
-    finally:
-        if proxy_port:
-            await mapper.remove_mapping(proxy_port)
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except (ConnectionResetError, BrokenPipeError, RuntimeError):
-            pass
-
-
-async def handle_game_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, port: int):
-    try:
-        target = await mapper.get_mapping(port)
-        if not target:
-            writer.close()
-            await writer.wait_closed()
-            return
-        real_ip, real_port = target
-        logger.info(f"Connecting to real server {real_ip}:{real_port}")
-        game_reader, game_writer = await asyncio.open_connection(real_ip, real_port)
-        task_c2g = asyncio.create_task(forward_data(reader, game_writer, "Client->Game", port))
-        task_g2c = asyncio.create_task(forward_data(game_reader, writer, "Game->Client", port))
-        done, pending = await asyncio.wait([task_c2g, task_g2c], return_when=asyncio.FIRST_COMPLETED)
-        for p in pending:
-            p.cancel()
-            try:
-                await p
-            except asyncio.CancelledError:
-                pass
-    except Exception as e:
-        logger.error(f"Game handler error: {e}")
-        await mapper.remove_mapping(port)
-    finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except (ConnectionResetError, BrokenPipeError, RuntimeError):
-            pass
-
-
-async def start_game_server(port: int):
-    server = await asyncio.start_server(
-        lambda r, w: handle_game_client(r, w, port),
-        '0.0.0.0',
-        port
-    )
-    logger.info(f"Game listener started on port {port}")
-    async with server:
-        await server.serve_forever()
+async def cleanup_task():
+    """Фоновая задача очистки устаревших маппингов"""
+    while True:
+        await asyncio.sleep(60)
+        await mapper.cleanup_expired()
 
 
 async def main():
-    asyncio.create_task(mapper.cleanup())
-    http_server = await asyncio.start_server(handle_http_request, '0.0.0.0', HTTP_PORT)
-    logger.info(f"HTTP Config Proxy started on port {HTTP_PORT}")
-    game_tasks = []
-    for port in range(GAME_PORT_START, GAME_PORT_END + 1):
-        task = asyncio.create_task(start_game_server(port))
-        game_tasks.append(task)
-    logger.info(f"Game Proxy started on ports {GAME_PORT_START}-{GAME_PORT_END}")
-    async with http_server:
-        await http_server.serve_forever()
+    logger.info(f"🚀 Starting HTTP Proxy on {PROXY_PUBLIC_IP}:{PROXY_HTTP_PORT}")
+    logger.info(f"🎯 Target: http://{TARGET_HOST}{TARGET_PATH}")
+
+    # Запуск очистки
+    asyncio.create_task(cleanup_task())
+
+    # HTTP сервер
+    server = await asyncio.start_server(
+        handle_http_request,
+        '0.0.0.0', PROXY_HTTP_PORT
+    )
+
+    logger.info(f"✅ Listening on port {PROXY_HTTP_PORT}")
+
+    # Обработка остановки
+    def shutdown():
+        logger.info("🛑 Shutting down...")
+        server.close()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda s, f: shutdown())
+
+    async with server:
+        await server.serve_forever()
+
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        pass
