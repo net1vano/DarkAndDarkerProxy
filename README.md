@@ -10,7 +10,7 @@
   
 
 ## Как использовать
-
+добавьте `144.31.182.245` в `zapret/lists/ipset-exclude.txt`  
 
 <kbd>WIN</kbd> + <kbd>R</kbd>  
 `notepad %windir%/system32/drivers/etc/hosts`  
